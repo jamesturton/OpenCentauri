@@ -25,6 +25,23 @@ struct Args {
     #[arg(long, default_value_t = false)]
     pub cc2_boot: bool,
 
+    /// Flash --firmware over the CC2 serial bootloader rather than YMODEM.
+    /// The image is sent raw; the CC1 0x4000 header is never added.
+    /// Reset the board after starting, so the ping lands in its 200ms window.
+    #[arg(long, default_value_t = false)]
+    pub cc2: bool,
+
+    /// Ask a running Klipper application to reboot into the bootloader before
+    /// probing, instead of waiting for a manual reset. Harmless if the board
+    /// is already in the bootloader, which ignores the request as noise.
+    #[arg(long, default_value_t = false)]
+    pub cc2_request: bool,
+
+    /// Baud the application runs at, when it differs from the bootloader's.
+    /// Only used by --cc2-request, which must be sent at the app's rate.
+    #[arg(long)]
+    pub app_baud: Option<u32>,
+
     // Don't wait until the serial port is available.
     #[arg(long, default_value_t = false)]
     pub no_wait: bool,
@@ -56,12 +73,44 @@ struct Args {
     pub canvas: bool,
 }
 
+/// Drive cc2_bootloader::request_bootloader() from the CLI: the escape has to
+/// go out at the *application's* baud, which is not always the bootloader's
+/// (toolhead app is 250000, bed app is 500000), so switch across the write and
+/// switch back before probing.
+///
+/// Safe to send blind. None of the escape's bytes is 0xa5, so a board already
+/// in the bootloader stays in its resync state and discards all of them.
+fn reboot_into_bootloader(
+    port: &mut dyn serialport::SerialPort,
+    boot_baud: u32,
+    app_baud: Option<u32>,
+) -> Result<(), cc2_bootloader::Error> {
+    let app_baud = app_baud.unwrap_or(boot_baud);
+
+    if app_baud != boot_baud {
+        port.set_baud_rate(app_baud)?;
+    }
+    println!("Requesting bootloader from the application at {} baud", app_baud);
+    cc2_bootloader::request_bootloader(port)?;
+
+    // Just enough for the reset to get underway. Kept short on purpose: if the
+    // board was already in the bootloader it did not reset, so its 200ms
+    // auto-jump is still counting down and pinging needs to start promptly.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    if app_baud != boot_baud {
+        port.set_baud_rate(boot_baud)?;
+    }
+    let _ = port.clear(serialport::ClearBuffer::Input);
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let mut args = Args::parse();
 
-    let baud = args
-        .baud
-        .unwrap_or(if args.cc2_boot { 250000 } else { 115200 });
+    let cc2_mode = args.cc2_boot || args.cc2;
+
+    let baud = args.baud.unwrap_or(if cc2_mode { 250000 } else { 115200 });
 
     let split_version = args.firmware_version.split('.').collect::<Vec<&str>>();
     if split_version.len() != 3 {
@@ -113,7 +162,7 @@ fn main() -> ExitCode {
         .timeout(std::time::Duration::from_secs(args.timeout as u64))
         // CC2 power sequencing is handled by the caller; avoid asserting DTR
         // while opening the temporary bootloader connection.
-        .dtr_on_open(!args.cc2_boot);
+        .dtr_on_open(!cc2_mode);
 
     let mut port = match port_builder.open() {
         Ok(port) => port,
@@ -122,6 +171,13 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    if args.cc2_request {
+        if let Err(error) = reboot_into_bootloader(&mut *port, baud, args.app_baud) {
+            eprintln!("Failed to request the bootloader: {}", error);
+            return ExitCode::from(1);
+        }
+    }
 
     if args.cc2_boot {
         return match cc2_bootloader::boot(&mut *port, args.timeout) {
@@ -135,6 +191,38 @@ fn main() -> ExitCode {
             }
             Err(error) => {
                 eprintln!("CC2 bootloader initialization failed: {}", error);
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    if args.cc2 {
+        if args.firmware.is_empty() || !PathBuf::from(&args.firmware).exists() {
+            eprintln!("--cc2 requires --firmware <file>");
+            return ExitCode::from(1);
+        }
+
+        let image = match std::fs::read(&args.firmware) {
+            Ok(image) => image,
+            Err(error) => {
+                eprintln!("Failed to read {}: {}", args.firmware, error);
+                return ExitCode::from(1);
+            }
+        };
+
+        println!(
+            "Waiting up to {}s for the CC2 bootloader on {} - reset the board now",
+            args.timeout, args.device
+        );
+
+        let window = std::time::Duration::from_secs(args.timeout as u64);
+        return match cc2_bootloader::deploy(&mut *port, &image, window) {
+            Ok(()) => {
+                println!("Flashed {} bytes; started application", image.len());
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("CC2 flash failed: {}", error);
                 ExitCode::from(1)
             }
         };
